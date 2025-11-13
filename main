@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1.0" />
+<title>PDF 左右分割 → JPG 一括出力（モバイル向け）</title>
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;padding:16px;color:#111}
+  h1{font-size:1.1rem;margin:0 0 12px}
+  label{display:block;margin:10px 0 6px;font-weight:600}
+  input,button,select{font-size:16px;padding:8px;width:100%;box-sizing:border-box}
+  small{color:#555}
+  #log{white-space:pre-wrap;margin-top:10px;background:#f8f8f8;padding:8px;border-radius:6px;max-height:220px;overflow:auto}
+</style>
+</head>
+<body>
+<h1>PDF → 左右分割 JPG 出力（ZIP）</h1>
+
+<label>PDFファイルを選択</label>
+<input id="file" type="file" accept="application/pdf" />
+
+<label>出力JPEG品質（0.1〜1.0）</label>
+<input id="quality" type="number" min="0.1" max="1" step="0.1" value="0.9" />
+
+<label>レンダリング倍率（1〜2 推奨。高いほど高画質）</label>
+<input id="scale" type="number" min="0.5" max="3" step="0.1" value="1.5" />
+
+<label>左右分割オフセット（px） — 片側に余白がある場合に調整</label>
+<input id="offset" type="number" step="1" value="0" />
+
+<button id="run">処理してZIPを作成</button>
+
+<div id="log" aria-live="polite"></div>
+
+<!-- ライブラリ：PDF.js, JSZip, FileSaver -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.9.179/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+
+<script>
+(async ()=> {
+  const fileInput = document.getElementById('file');
+  const runBtn = document.getElementById('run');
+  const logEl = document.getElementById('log');
+  const qualityEl = document.getElementById('quality');
+  const scaleEl = document.getElementById('scale');
+  const offsetEl = document.getElementById('offset');
+
+  function log(...args){ logEl.textContent += args.join(' ') + '\\n'; logEl.scrollTop = logEl.scrollHeight; }
+
+  // PDF.js 一時設定
+  pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.9.179/pdf.worker.min.js';
+
+  runBtn.addEventListener('click', async ()=>{
+    logEl.textContent = '';
+    const f = fileInput.files && fileInput.files[0];
+    if(!f){ log('PDFファイルを選択してください'); return; }
+
+    const quality = Math.max(0.1, Math.min(1, parseFloat(qualityEl.value) || 0.9));
+    const scale = Math.max(0.5, Math.min(3, parseFloat(scaleEl.value) || 1.5));
+    const offset = parseInt(offsetEl.value) || 0;
+
+    log('読み込み中:', f.name);
+    const arrayBuffer = await f.arrayBuffer();
+    log('PDFロード...');
+    const pdf = await pdfjsLib.getDocument({data: arrayBuffer}).promise;
+    const pageCount = pdf.numPages;
+    log('総ページ数:', pageCount);
+
+    const zip = new JSZip();
+    let produced = 0;
+
+    for(let i=1;i<=pageCount;i++){
+      try{
+        log('ページ', i, 'をレンダリング...');
+        const page = await pdf.getPage(i);
+        const viewport = page.getViewport({scale: scale});
+        // Canvasに描画（高解像度）
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        canvas.width = Math.round(viewport.width);
+        canvas.height = Math.round(viewport.height);
+        // 背景白で塗る（透明PDF対策）
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(0,0,canvas.width,canvas.height);
+
+        await page.render({canvasContext: ctx, viewport: viewport}).promise;
+
+        // 左右に分割（幅を半分とし、オフセットを反映）
+        const halfW = Math.floor(canvas.width / 2);
+        // 左：x=0+offset, 幅=halfW-offset ; 右：x=halfW+offset, 幅=halfW-offset
+        const leftX = Math.max(0, 0 + offset);
+        const rightX = Math.min(canvas.width, halfW + offset);
+        const leftW = Math.max(1, Math.min(halfW, halfW - offset));
+        const rightW = Math.max(1, Math.min(halfW, canvas.width - rightX));
+
+        // 左画像作成
+        const leftCanvas = document.createElement('canvas');
+        leftCanvas.width = leftW;
+        leftCanvas.height = canvas.height;
+        leftCanvas.getContext('2d').drawImage(canvas, leftX, 0, leftW, canvas.height, 0, 0, leftW, canvas.height);
+
+        // 右画像作成
+        const rightCanvas = document.createElement('canvas');
+        rightCanvas.width = rightW;
+        rightCanvas.height = canvas.height;
+        rightCanvas.getContext('2d').drawImage(canvas, rightX, 0, rightW, canvas.height, 0, 0, rightW, canvas.height);
+
+        // JPEGへ変換（base64 -> binary）
+        const leftData = await canvasToJpegBlob(leftCanvas, quality);
+        const rightData = await canvasToJpegBlob(rightCanvas, quality);
+
+        // ファイル名例: 001_L.jpg, 001_R.jpg
+        const pidx = String(i).padStart(3,'0');
+        zip.file(`${pidx}_L.jpg`, leftData);
+        zip.file(`${pidx}_R.jpg`, rightData);
+
+        produced += 2;
+        log(`ページ ${i}: 左右2枚を追加 (合計 ${produced} 枚)`);
+        // メモリ軽減のためDOM参照を切る
+        leftCanvas.width = leftCanvas.height = 0;
+        rightCanvas.width = rightCanvas.height = 0;
+        canvas.width = canvas.height = 0;
+      } catch(e){
+        console.error(e);
+        log('ページ', i, 'でエラー:', e.message || e);
+      }
+      // 少しだけ待つことでUIを応答させる
+      await new Promise(r=>setTimeout(r, 50));
+    }
+
+    log('ZIPを生成中...');
+    const zipBlob = await zip.generateAsync({type:'blob', compression:'DEFLATE'});
+    const outName = (f.name.replace(/\\.pdf$/i,'') || 'output') + '_split_images.zip';
+    saveAs(zipBlob, outName);
+    log('完了。ZIPをダウンロードしました：' + outName);
+  });
+
+  async function canvasToJpegBlob(c, quality=0.9){
+    return new Promise(resolve=>{
+      c.toBlob(blob => resolve(blob), 'image/jpeg', quality);
+    });
+  }
+})();
+</script>
+</body>
+</html>
